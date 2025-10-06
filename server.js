@@ -1,23 +1,25 @@
+// server.js
 import express from "express";
-import fetch from "node-fetch";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
+import { status as mcStatus } from "minecraft-server-util";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ---- CONFIG ----
-const MINECRAFT_SERVER = "minecraft.iamjeb.com"; // no port
+const MINECRAFT_SERVER = "minecraft.iamjeb.com"; // hostname only
+const JAVA_PORT = 25565;
 const REFRESH_INTERVAL = 60; // seconds
-const TIMEZONE = "America/Detroit"; // Corrected timezone
+const TIMEZONE = "America/Detroit"; // Detroit
 
 // ---- Path setup ----
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-app.use(express.static(__dirname + "/public"));
+app.use(express.static(path.join(__dirname, "public")));
 
-// ---- Helper: Convert uptime seconds ----
+// ---- Helpers ----
 function formatUptime(seconds) {
   const days = Math.floor(seconds / (3600 * 24));
   seconds %= 3600 * 24;
@@ -28,33 +30,79 @@ function formatUptime(seconds) {
   return `${days}d ${hours}h ${minutes}m ${seconds}s`;
 }
 
-// ---- API to check Minecraft status ----
-app.get("/api/status", async (req, res) => {
+// ---- Status API (direct ping first, public API fallback) ----
+app.get("/api/status", async (_req, res) => {
   try {
-    const response = await fetch(`https://api.mcstatus.io/v2/status/java/${MINECRAFT_SERVER}`);
-    const data = await response.json();
+    // Direct ping from the app to your server
+    const ping = await mcStatus(MINECRAFT_SERVER, {
+      port: JAVA_PORT,
+      enableSRV: true,
+      timeout: 3000,
+    });
 
-    const isOnline = data.online;
-    const playerCount = isOnline ? data.players.online : 0;
-    const latency = isOnline ? data.latency : null;
+    // minecraft-server-util v5 returns something like:
+    // { version, players: { online, max, sample }, roundTripLatency, motd, ... }
+    const playerCount =
+      (ping.players && (ping.players.online ?? ping.players.onlinePlayers)) ?? 0;
+    const latency = ping.roundTripLatency ?? null;
 
-    res.json({
-      online: isOnline,
+    return res.json({
+      online: true,
       playerCount,
       latency,
-      hostname: data.host,
-      version: data.version?.name_clean || "Unknown",
-      motd: data.motd?.clean || "",
+      hostname: MINECRAFT_SERVER,
+      version: ping.version?.name || ping.version || "Unknown",
+      motd:
+        (ping.motd &&
+          (Array.isArray(ping.motd.clean)
+            ? ping.motd.clean.join(" ")
+            : ping.motd.clean || ping.motd)) ||
+        "",
       time: new Date().toLocaleString("en-US", { timeZone: TIMEZONE }),
       uptime: formatUptime(process.uptime()),
     });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to fetch server status" });
+  } catch (e) {
+    // Fallback to mcstatus API (best-effort) to avoid false “offline”
+    try {
+      const resp = await fetch(
+        `https://api.mcstatus.io/v2/status/java/${encodeURIComponent(
+          MINECRAFT_SERVER
+        )}`
+      );
+      if (!resp.ok) throw new Error("mcstatus non-200");
+      const data = await resp.json();
+
+      const isOnline = !!data.online;
+      const playerCount = isOnline ? data.players?.online ?? 0 : 0;
+      const latency = isOnline ? data.latency ?? null : null;
+
+      return res.json({
+        online: isOnline,
+        playerCount,
+        latency,
+        hostname: data.host || MINECRAFT_SERVER,
+        version: data.version?.name_clean || "Unknown",
+        motd: data.motd?.clean || "",
+        time: new Date().toLocaleString("en-US", { timeZone: TIMEZONE }),
+        uptime: formatUptime(process.uptime()),
+      });
+    } catch {
+      return res.json({
+        online: false,
+        playerCount: 0,
+        latency: null,
+        hostname: MINECRAFT_SERVER,
+        version: "Unknown",
+        motd: "",
+        time: new Date().toLocaleString("en-US", { timeZone: TIMEZONE }),
+        uptime: formatUptime(process.uptime()),
+      });
+    }
   }
 });
 
-// ---- Web page ----
-app.get("/", (req, res) => {
+// ---- Web page (old look, with your tweaks) ----
+app.get("/", (_req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html>
@@ -63,26 +111,26 @@ app.get("/", (req, res) => {
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <style>
         body {
-          background-color: #0b0b0e;
-          color: #e3e3e3;
+          background-color: #0f1115;
+          color: #d7d7d7;
           font-family: 'Segoe UI', Roboto, sans-serif;
           text-align: center;
           margin: 0;
           padding: 0;
         }
         h1 {
-          color: #00ffb3;
-          font-size: 2.2rem;
-          margin-top: 30px;
+          color: #00e0a0;
+          font-size: 2.4rem;
+          margin-top: 40px;
         }
         #statusBox {
-          background-color: #141417;
-          border: 1px solid #2a2a2e;
+          background-color: #181a20;
           border-radius: 12px;
-          box-shadow: 0 0 25px rgba(0, 255, 200, 0.1);
+          box-shadow: 0 0 15px rgba(0, 255, 160, 0.1);
           margin: 40px auto;
           max-width: 600px;
           padding: 25px;
+          border: 1px solid #252830;
         }
         .badge {
           padding: 6px 12px;
@@ -99,23 +147,26 @@ app.get("/", (req, res) => {
         }
         footer {
           color: #888;
-          font-size: 0.85rem;
+          font-size: 0.9rem;
           margin-top: 40px;
+          padding-bottom: 20px;
+        }
+        .refresh {
+          color: #aaa;
+          font-size: 0.95rem;
+          margin-top: 15px;
         }
         canvas {
           max-width: 600px;
           margin: 30px auto;
           display: block;
         }
-        .refresh {
-          color: #888;
-          font-size: 0.9rem;
-        }
       </style>
       <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     </head>
     <body>
       <h1>iamJeb's Public Server Dashboard</h1>
+
       <div id="statusBox">
         <p><b>Status:</b> <span id="status">Checking...</span></p>
         <p><b>Players:</b> <span id="players">-</span></p>
@@ -143,7 +194,7 @@ app.get("/", (req, res) => {
             datasets: [{
               label: 'Latency (ms)',
               borderColor: '#00ffb3',
-              backgroundColor: 'rgba(0,255,179,0.2)',
+              backgroundColor: 'rgba(0,255,179,0.15)',
               data: latencyData,
               tension: 0.3
             }]
@@ -159,10 +210,10 @@ app.get("/", (req, res) => {
 
         async function updateStatus() {
           try {
-            const res = await fetch('/api/status');
+            const res = await fetch('/api/status', { cache: 'no-store' });
             const data = await res.json();
 
-            document.getElementById('status').innerHTML = data.online 
+            document.getElementById('status').innerHTML = data.online
               ? '<span class="badge online">Online</span>'
               : '<span class="badge offline">Offline</span>';
             document.getElementById('players').textContent = data.playerCount;
@@ -170,7 +221,7 @@ app.get("/", (req, res) => {
             document.getElementById('time').textContent = data.time;
             document.getElementById('uptime').textContent = data.uptime;
 
-            if (data.latency) {
+            if (typeof data.latency === 'number') {
               const now = new Date().toLocaleTimeString("en-US", { timeZone: "${TIMEZONE}" });
               latencyData.push(data.latency);
               timeLabels.push(now);
@@ -204,4 +255,7 @@ app.get("/", (req, res) => {
   `);
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Simple healthcheck
+app.get("/healthz", (_req, res) => res.send("ok"));
+
+app.listen(PORT, () => console.log(`Web app running on port ${PORT}`));
